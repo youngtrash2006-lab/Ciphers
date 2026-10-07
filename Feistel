@@ -1,0 +1,198 @@
+"""
+Шифр Фейстеля (Feistel network). 64-битный блок = L (32 бита) + R (32 бита).
+
+Принцип (согласно классической схеме):
+    L_i = R_{i-1}
+    R_i = L_{i-1} XOR F(R_{i-1}, K_i)
+
+После последнего раунда половины НЕ меняются местами — именно поэтому
+расшифрование можно выполнить тем же самым алгоритмом, просто подав
+раундовые ключи в обратном порядке.
+
+Как и в прошлой версии:
+  - Один случайный МАСТЕР-КЛЮЧ, из которого выводятся раундовые ключи
+    (key schedule).
+  - Блоки сцеплены между собой (аналог режима CBC) через IV.
+  - Текст произвольной длины режется на 64-битные блоки с паддингом.
+
+Раундовая функция F сама по себе необратима (как и требует схема Фейстеля) —
+внутри неё используются XOR с ключом, S-BOX (замена) и P-BOX (перестановка),
+применённые к 32-битной половине.
+"""
+
+import secrets
+
+BLOCK_BITS = 64
+BLOCK_BYTES = BLOCK_BITS // 8
+HALF_BITS = 32
+MASK32 = (1 << 32) - 1
+MASK64 = (1 << 64) - 1
+ROUNDS = 8
+
+# ---------- S-BOX (замена 4 бита -> 4 бита), используется внутри F ----------
+SBOX = [0x6, 0x4, 0xC, 0x5, 0x0, 0x7, 0x2, 0xE,
+        0x1, 0xF, 0x3, 0xD, 0x8, 0xA, 0x9, 0xB]
+
+
+def substitute_32(half: int) -> int:
+    result = 0
+    for i in range(HALF_BITS // 4):          # 32 бита = 8 нибблов
+        nibble = (half >> (i * 4)) & 0xF
+        result |= SBOX[nibble] << (i * 4)
+    return result
+
+
+# ---------- P-BOX для 32-битной половины, фиксированная таблица ----------
+PBOX32 = [28, 9, 19, 10, 29, 5, 7, 22, 0, 14, 8, 15, 23, 24, 21, 13,
+          25, 27, 6, 16, 26, 18, 11, 3, 17, 2, 1, 31, 12, 4, 30, 20]
+
+
+def permute_32(half: int) -> int:
+    result = 0
+    for new_pos, old_pos in enumerate(PBOX32):
+        bit = (half >> old_pos) & 1
+        result |= bit << new_pos
+    return result
+
+
+# ---------- Раундовая функция F(R, K) ----------
+def F(half: int, round_key: int) -> int:
+    """
+    F не обязана быть обратимой — в схеме Фейстеля это не требуется,
+    обратимость всей конструкции обеспечивается структурой XOR, а не
+    самой функцией F.
+    """
+    state = half ^ (round_key & MASK32)
+    state = substitute_32(state)
+    state = permute_32(state)
+    return state
+
+
+# ---------- Мастер-ключ и key schedule ----------
+ROUND_CONST = 0x9E3779B97F4A7C15  # константа золотого сечения
+
+
+def rotl64(x: int, r: int) -> int:
+    r %= 64
+    return ((x << r) | (x >> (64 - r))) & MASK64
+
+
+def generate_master_key() -> int:
+    return secrets.randbits(BLOCK_BITS)
+
+
+def key_schedule(master_key: int, rounds: int = ROUNDS) -> list:
+    """
+    Из одного 64-битного мастер-ключа выводим `rounds` 32-битных раундовых
+    ключей K_1..K_n: на каждом шаге поворачиваем 64-битное состояние на 7
+    бит и XOR-им с меняющейся константой, затем берём младшие 32 бита.
+    """
+    keys = []
+    state = master_key
+    for i in range(rounds):
+        state = rotl64(state, 7)
+        state ^= (ROUND_CONST + i) & MASK64
+        keys.append(state & MASK32)
+    return keys
+
+
+# ---------- Дополнение блоков ----------
+def pad(data: bytes) -> bytes:
+    pad_len = BLOCK_BYTES - (len(data) % BLOCK_BYTES)
+    return data + bytes([pad_len]) * pad_len
+
+
+def unpad(data: bytes) -> bytes:
+    pad_len = data[-1]
+    return data[:-pad_len]
+
+
+def hexf(value: int, width: int = 8) -> str:
+    return f"{value:0{width}x}"
+
+
+# ---------- Шифрование одного 64-битного блока ----------
+def feistel_encrypt_block(block_int: int, round_keys: list, label: str) -> int:
+    L = (block_int >> HALF_BITS) & MASK32
+    R = block_int & MASK32
+
+    for r, K in enumerate(round_keys, start=1):
+        new_L = R
+        new_R = L ^ F(R, K)
+        print(f"{label} — Раунд {r}:  L={hexf(new_L)}  R={hexf(new_R)}")
+        L, R = new_L, new_R
+
+    return (L << HALF_BITS) | R
+
+
+# ---------- Расшифрование одного 64-битного блока ----------
+def feistel_decrypt_block(cipher_int: int, round_keys: list) -> int:
+    L = (cipher_int >> HALF_BITS) & MASK32
+    R = cipher_int & MASK32
+
+    # раундовые ключи подаются в обратном порядке
+    for K in reversed(round_keys):
+        new_R = L
+        new_L = R ^ F(L, K)
+        L, R = new_L, new_R
+
+    return (L << HALF_BITS) | R
+
+
+# ---------- Шифрование текста (со сцеплением блоков, аналог CBC) ----------
+def encrypt_text(text: str, master_key: int):
+    round_keys = key_schedule(master_key)
+    data = pad(text.encode("utf-8"))
+    total_blocks = len(data) // BLOCK_BYTES
+
+    iv = secrets.randbits(BLOCK_BITS)
+    prev_cipher = iv
+    ciphertext = b""
+
+    for idx, i in enumerate(range(0, len(data), BLOCK_BYTES), start=1):
+        block_int = int.from_bytes(data[i:i + BLOCK_BYTES], "big")
+        block_int ^= prev_cipher  # сцепление с предыдущим шифроблоком
+
+        label = f"Кусок {idx} из {total_blocks}"
+        cipher_int = feistel_encrypt_block(block_int, round_keys, label)
+
+        prev_cipher = cipher_int
+        ciphertext += cipher_int.to_bytes(BLOCK_BYTES, "big")
+
+    return ciphertext, iv
+
+
+def decrypt_text(ciphertext: bytes, master_key: int, iv: int) -> str:
+    round_keys = key_schedule(master_key)
+    prev_cipher = iv
+    data = b""
+
+    for i in range(0, len(ciphertext), BLOCK_BYTES):
+        cipher_block = ciphertext[i:i + BLOCK_BYTES]
+        cipher_int = int.from_bytes(cipher_block, "big")
+
+        block_int = feistel_decrypt_block(cipher_int, round_keys)
+        block_int ^= prev_cipher  # отменяем сцепление блоков
+
+        data += block_int.to_bytes(BLOCK_BYTES, "big")
+        prev_cipher = cipher_int
+
+    return unpad(data).decode("utf-8")
+
+
+if __name__ == "__main__":
+    word = input("Введите слово для шифрования (Enter — 'Привет'): ").strip()
+    if not word:
+        word = "Привет"
+
+    master_key = generate_master_key()
+    ciphertext, iv = encrypt_text(word, master_key)
+
+    print(f"\nСлово: {word}")
+    print(f"Мастер-ключ: {hexf(master_key, 16)}")
+    print(f"IV: {hexf(iv, 16)}")
+    print(f"Зашифровано (hex): {ciphertext.hex()}")
+
+    decrypted = decrypt_text(ciphertext, master_key, iv)
+    print(f"\nРасшифровано: {decrypted}")
+    print(f"Совпадает с исходным: {decrypted == word}")

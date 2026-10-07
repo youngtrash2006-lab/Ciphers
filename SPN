@@ -1,0 +1,208 @@
+"""
+Обновления:
+  1. P-BOX теперь фиксированная, заранее известная таблица (не генерируется
+     заново случайно при каждом запуске).
+  2. Вместо отдельного случайного ключа на каждый раунд — генерируется ОДИН
+     случайный мастер-ключ, а раундовые ключи выводятся из него по
+     детерминированному правилу (key schedule).
+  3. Блок остаётся 64 бита (8 байт) — этого достаточно для шифрования текста
+     любой длины, так как текст режется на много блоков подряд.
+  4. Блоки теперь связаны между собой (аналог режима CBC): перед шифрованием
+     каждый блок открытого текста XOR-ится с шифротекстом ПРЕДЫДУЩЕГО блока
+     (первый блок — со случайным вектором инициализации IV). Это значит, что
+     одинаковые блоки текста дают разный шифротекст, и блоки больше не
+     шифруются полностью независимо друг от друга.
+"""
+
+import secrets
+
+BLOCK_BITS = 64
+BLOCK_BYTES = BLOCK_BITS // 8
+MASK64 = (1 << 64) - 1
+ROUNDS = 8
+
+# ---------- S-BOX (замена 4 бита -> 4 бита) ----------
+SBOX = [0x6, 0x4, 0xC, 0x5, 0x0, 0x7, 0x2, 0xE,
+        0x1, 0xF, 0x3, 0xD, 0x8, 0xA, 0x9, 0xB]
+
+
+INV_SBOX = [0] * 16
+for i, v in enumerate(SBOX):
+    INV_SBOX[v] = i
+
+
+def substitute(block: int) -> int:
+    result = 0
+    for i in range(BLOCK_BITS // 4):
+        nibble = (block >> (i * 4)) & 0xF
+        result |= SBOX[nibble] << (i * 4)
+    return result
+
+
+def inverse_substitute(block: int) -> int:
+    result = 0
+    for i in range(BLOCK_BITS // 4):
+        nibble = (block >> (i * 4)) & 0xF
+        result |= INV_SBOX[nibble] << (i * 4)
+    return result
+
+
+# ---------- P-BOX: фиксированная, заранее известная таблица перестановки ----------
+# PBOX[new_pos] = old_pos — бит из позиции old_pos переезжает в позицию new_pos.
+# Таблица зафиксирована раз и навсегда (не пересоздаётся каждый запуск),
+# как это устроено в настоящих блочных шифрах (например, в DES).
+PBOX = [23, 25, 7, 22, 45, 33, 19, 59, 46, 9, 40, 18, 42, 31, 16, 21,
+        36, 41, 29, 20, 11, 50, 39, 48, 3, 30, 24, 55, 4, 57, 54, 49,
+        10, 0, 60, 28, 44, 26, 52, 12, 35, 53, 38, 32, 58, 13, 51, 62,
+        2, 27, 37, 5, 34, 56, 43, 6, 61, 8, 63, 15, 17, 47, 1, 14]
+
+
+def permute(block: int) -> int:
+    result = 0
+    for new_pos, old_pos in enumerate(PBOX):
+        bit = (block >> old_pos) & 1
+        result |= bit << new_pos
+    return result
+
+
+def inverse_permute(block: int) -> int:
+    result = 0
+    for new_pos, old_pos in enumerate(PBOX):
+        bit = (block >> new_pos) & 1
+        result |= bit << old_pos
+    return result
+
+
+# ---------- Мастер-ключ и вывод раундовых ключей (key schedule) ----------
+ROUND_CONST = 0x9E3779B97F4A7C15  # константа золотого сечения, часто используется в key schedule
+
+
+def rotl(x: int, r: int, bits: int = BLOCK_BITS) -> int:
+    r %= bits
+    return ((x << r) | (x >> (bits - r))) & MASK64
+
+
+def generate_master_key() -> int:
+    return secrets.randbits(BLOCK_BITS)
+
+
+def key_schedule(master_key: int, rounds: int = ROUNDS) -> list:
+    """
+    Из одного мастер-ключа детерминированно получаем `rounds` раундовых
+    ключей: на каждом шаге поворачиваем текущее состояние на 7 бит влево
+    и делаем XOR с изменяющейся от раунда к раунду константой.
+    Один и тот же мастер-ключ всегда даёт один и тот же набор раундовых
+    ключей — это и отличает key schedule от прежней полностью случайной
+    генерации ключа на каждом раунде.
+    """
+    keys = []
+    state = master_key
+    for i in range(rounds):
+        state = rotl(state, 7)
+        state ^= (ROUND_CONST + i) & MASK64
+        keys.append(state)
+    return keys
+
+
+# ---------- Дополнение блоков (PKCS7-подобное) ----------
+def pad(data: bytes) -> bytes:
+    pad_len = BLOCK_BYTES - (len(data) % BLOCK_BYTES)
+    return data + bytes([pad_len]) * pad_len
+
+
+def unpad(data: bytes) -> bytes:
+    pad_len = data[-1]
+    return data[:-pad_len]
+
+
+def hexf(value: int) -> str:
+    return f"{value:016x}"
+
+
+# ---------- Шифрование одного блока (с выводом по раундам) ----------
+def encrypt_block(block_int: int, round_keys: list, label: str) -> int:
+    state = block_int
+    for r, key in enumerate(round_keys, start=1):
+        state ^= key
+
+        print(f"\n{label} — Раунд {r}:")
+        print(f"  Исходный:    {hexf(state)}")
+
+        state = substitute(state)
+        print(f"  После S-BOX: {hexf(state)}")
+
+        state = permute(state)
+        print(f"  После P-BOX: {hexf(state)}")
+
+    return state
+
+
+def decrypt_block(cipher_int: int, round_keys: list) -> int:
+    state = cipher_int
+    for key in reversed(round_keys):
+        state = inverse_permute(state)
+        state = inverse_substitute(state)
+        state ^= key
+    return state
+
+
+# ---------- Шифрование текста (с цепочкой блоков, аналог CBC) ----------
+def encrypt_text(text: str, master_key: int):
+    round_keys = key_schedule(master_key)
+    data = pad(text.encode("utf-8"))
+    total_blocks = len(data) // BLOCK_BYTES
+
+    iv = secrets.randbits(BLOCK_BITS)  # вектор инициализации для первого блока
+    prev_cipher = iv
+    ciphertext = b""
+
+    for idx, i in enumerate(range(0, len(data), BLOCK_BYTES), start=1):
+        block_int = int.from_bytes(data[i:i + BLOCK_BYTES], "big")
+
+        # сцепление блоков: XOR текущего блока с шифротекстом предыдущего
+        block_int ^= prev_cipher
+
+        label = f"Кусок {idx} из {total_blocks}"
+        cipher_int = encrypt_block(block_int, round_keys, label)
+
+        prev_cipher = cipher_int  # следующий блок будет зависеть от этого
+        ciphertext += cipher_int.to_bytes(BLOCK_BYTES, "big")
+
+    return ciphertext, iv
+
+
+def decrypt_text(ciphertext: bytes, master_key: int, iv: int) -> str:
+    round_keys = key_schedule(master_key)
+    prev_cipher = iv
+    data = b""
+
+    for i in range(0, len(ciphertext), BLOCK_BYTES):
+        cipher_block = ciphertext[i:i + BLOCK_BYTES]
+        cipher_int = int.from_bytes(cipher_block, "big")
+
+        block_int = decrypt_block(cipher_int, round_keys)
+        # отменяем сцепление блоков: XOR с шифротекстом предыдущего блока
+        block_int ^= prev_cipher
+
+        data += block_int.to_bytes(BLOCK_BYTES, "big")
+        prev_cipher = cipher_int  # тот же порядок, что при шифровании
+
+    return unpad(data).decode("utf-8")
+
+
+if __name__ == "__main__":
+    word = input("Введите слово для шифрования (Enter — 'Привет'): ").strip()
+    if not word:
+        word = "Привет"
+
+    master_key = generate_master_key()
+    ciphertext, iv = encrypt_text(word, master_key)
+
+    print(f"\nСлово: {word}")
+    print(f"Мастер-ключ: {hexf(master_key)}")
+    print(f"IV (вектор инициализации): {hexf(iv)}")
+    print(f"Зашифровано (hex): {ciphertext.hex()}")
+
+    decrypted = decrypt_text(ciphertext, master_key, iv)
+    print(f"\nРасшифровано: {decrypted}")
+    print(f"Совпадает с исходным: {decrypted == word}")
